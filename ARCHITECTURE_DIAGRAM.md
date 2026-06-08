@@ -62,26 +62,9 @@ Input (x)                  Hidden State (h)
               │
               ▼
     ┌──────────────────┐
-    │  Reshape 3D→2D   │
-    │  [1×4, 8]        │
-    └──────────────────┘
-              │
-              ▼
-         [4, 8]
-              │
-              ▼
-    ┌──────────────────┐
     │  Linear Layer    │  ⚠️ REQUIRED
-    │  (8 → 3)         │
-    └──────────────────┘
-              │
-              ▼
-         [4, 3]
-              │
-              ▼
-    ┌──────────────────┐
-    │  Reshape 2D→3D   │
-    │  [1, 4, 3]       │
+    │  (8 → 3, applied │
+    │   on last dim)   │
     └──────────────────┘
               │
               ▼
@@ -139,29 +122,18 @@ Input (x)                  Hidden State (h)
               │
               ▼
     ┌──────────────────┐
-    │  Reshape         │
-    │  [batch×seq,     │
-    │   hidden_size]   │
-    └──────────────────┘
-              │
-              ▼
-    [batch×seq, hidden_size]
-              │
-              ▼
-    ┌──────────────────┐
     │  Linear Layer    │  ⚠️ Output Projection
     │  (hidden_size    │
-    │   → output_size) │
+    │   → output_size, │
+    │   last dim only) │
     └──────────────────┘
               │
               ▼
-    [batch×seq, output_size]
+    [batch, seq, output_size]
               │
               ▼
     ┌──────────────────┐
-    │  Reshape         │
-    │  [batch, seq,    │
-    │   output_size]   │
+    │  Tanh Activation │
     └──────────────────┘
               │
               ▼
@@ -217,9 +189,10 @@ Input (x)                  Hidden State (h)
               │
               ▼
     ┌──────────────────┐
-    │  Reshape & Linear│  ⚠️ Output Projection
+    │  Linear Layer    │  ⚠️ Output Projection
     │  (hidden_size    │
-    │   → output_size) │
+    │   → output_size, │
+    │   last dim only) │
     └──────────────────┘
               │
               ▼
@@ -315,23 +288,16 @@ Step 2: GRU Processing
 └──────────┬───────────┘
            │
            ▼
-Step 3: Flatten Sequence
+Step 3: Linear Projection (last dim only)
 ┌──────────────────────┐
-│  Batch×Seq:     4    │  (1 × 4 = 4)
-│  Hidden Size:   8    │
-│  Shape: [4, 8]       │
-└──────────┬───────────┘
-           │
-           ▼
-Step 4: Linear Projection
-┌──────────────────────┐
-│  Batch×Seq:     4    │
+│  Batch Size:    1    │
+│  Sequence Len:  4    │
 │  Output Size:   3    │  ⚠️ Transformed!
-│  Shape: [4, 3]       │
+│  Shape: [1, 4, 3]    │
 └──────────┬───────────┘
            │
            ▼
-Step 5: Reshape to 3D
+Step 4: Tanh Activation (CustomGruRnn only)
 ┌──────────────────────┐
 │  Batch Size:    1    │
 │  Sequence Len:  4    │
