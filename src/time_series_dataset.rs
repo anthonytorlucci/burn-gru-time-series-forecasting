@@ -190,7 +190,7 @@ impl WindowedStockTimeSeriesDataset {
 
         Ok(Self {
             items: split_items,
-            sequence_length: sequence_length,
+            sequence_length,
         })
     }
 
@@ -238,6 +238,12 @@ pub struct StockTimeSeriesBatcher<B: Backend> {
     _backend: std::marker::PhantomData<B>,
 }
 
+impl<B: Backend> Default for StockTimeSeriesBatcher<B> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<B: Backend> StockTimeSeriesBatcher<B> {
     pub fn new() -> Self {
         Self {
@@ -260,7 +266,7 @@ impl<B: Backend> Batcher<B, StockTimeSeriesItemSample, (Tensor<B, 3, Float>, Ten
     ) -> (Tensor<B, 3, Float>, Tensor<B, 2, Float>) {
         let batch_size: usize = items.len();
         // Get sequence length from the first item. Assumes all items are the same length.
-        let sequence_length: usize = items.get(0).map_or(0, |item| item.inputs.len());
+        let sequence_length: usize = items.first().map_or(0, |item| item.inputs.len());
 
         if sequence_length == 0 {
             // Handle empty batch
