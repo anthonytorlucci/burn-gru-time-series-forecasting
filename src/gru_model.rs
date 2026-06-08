@@ -1,3 +1,33 @@
+//! GRU-based recurrent model definitions for time-series forecasting.
+//!
+//! Provides two model variants built on Burn's [`Gru`] primitive:
+//!
+//! - [`CustomGruRnn`] — single GRU layer with dropout, linear projection, and Tanh activation.
+//! - [`StackedGruRnn`] — two stacked GRU layers with per-layer dropout and a linear projection.
+//!
+//! Both expose a `forward` method (sequence-to-sequence) and a `forward_last` method
+//! (sequence-to-one), making them suitable for multi-step prediction and next-step
+//! forecasting respectively.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use burn::backend::NdArray;
+//! use burn::nn::Initializer;
+//! use burn_gru_time_series_forecasting::gru_model::{StackedGruRnn, StackedGruRnnConfig};
+//!
+//! let device = Default::default();
+//! let model: StackedGruRnn<NdArray> = StackedGruRnnConfig::new(
+//!     4,    // input_size
+//!     16,   // hidden_size
+//!     4,    // output_size
+//!     true, // bias
+//!     0.1,  // dropout
+//!     Initializer::XavierNormal { gain: 1.0 },
+//! )
+//! .init(&device);
+//! ```
+
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::gru::{Gru, GruConfig};
@@ -6,45 +36,59 @@ use burn::prelude::Shape;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Float, Tensor};
 
-// --- Complete Custom RNN Architecture Model
-/// A complete custom RNN model with all recommended components:
-/// - GRU layer for sequence processing
-/// - Dropout for regularization
-/// - Linear output projection (REQUIRED to match target shape)
-/// - Optional layer normalization
+/// Single-layer GRU model with dropout, linear projection, and Tanh activation.
+///
+/// Suitable for sequence-to-sequence or sequence-to-one regression tasks. The
+/// hidden state is zero-initialised on each forward pass unless an explicit
+/// initial state is supplied.
+///
+/// # Examples
+///
+/// ```no_run
+/// use burn::backend::NdArray;
+/// use burn::nn::Initializer;
+/// use burn_gru_time_series_forecasting::gru_model::{CustomGruRnn, CustomGruRnnConfig};
+///
+/// let device = Default::default();
+/// let model: CustomGruRnn<NdArray> = CustomGruRnnConfig::new(
+///     4, 16, 4, true, false, 0.1,
+///     Initializer::XavierNormal { gain: 1.0 },
+/// )
+/// .init(&device);
+/// ```
 #[derive(Module, Debug)]
 pub struct CustomGruRnn<B: Backend> {
-    /// Main GRU layer
+    /// GRU layer for sequence processing.
     gru: Gru<B>,
-    /// Dropout for regularization
+    /// Dropout applied after the GRU output.
     dropout: Dropout,
-    /// Output projection layer (projects hidden_size -> output_size)
+    /// Projects hidden states from `hidden_size` to `output_size`.
     output_projection: Linear<B>,
-    /// Activation function
+    /// Tanh activation applied after the output projection.
     activation: Tanh,
 }
 
-/// Configuration for the complete custom RNN model
+/// Configuration for [`CustomGruRnn`].
 #[derive(Config, Debug)]
 pub struct CustomGruRnnConfig {
-    /// Input feature size
+    /// Number of input features per time step.
     input_size: usize,
-    /// Hidden state size
+    /// Dimensionality of the GRU hidden state.
     hidden_size: usize,
-    /// Output size (must match target dimension)
+    /// Number of output features per time step.
     output_size: usize,
-    /// Whether to use bias in GRU
+    /// Whether to include bias terms in the GRU gates.
     bias: bool,
-    /// Whether to apply reset gate after matrix multiplication
+    /// When `true`, applies the reset gate after the matrix multiplication (Keras convention).
     reset_after: bool,
-    /// Dropout probability (0.0 = no dropout)
+    /// Dropout probability applied to GRU outputs; `0.0` disables dropout.
     dropout: f64,
-    /// Weight initializer
+    /// Weight initializer for GRU and linear layers.
     initializer: Initializer,
 }
 
 impl CustomGruRnnConfig {
-    /// Initialize the custom GRU RNN model
+    /// Initialises a [`CustomGruRnn`] model from this configuration.
     pub fn init<B: Backend>(&self, device: &B::Device) -> CustomGruRnn<B> {
         CustomGruRnn {
             gru: GruConfig::new(self.input_size, self.hidden_size, self.bias)
@@ -61,104 +105,136 @@ impl CustomGruRnnConfig {
 }
 
 impl<B: Backend> CustomGruRnn<B> {
-    /// Forward pass through the complete RNN architecture
+    /// Runs a full sequence through the model and returns all time-step outputs.
     ///
-    /// # Arguments
-    /// * `x` - Input tensor of shape [batch_size, sequence_length, input_size]
-    /// * `h` - Optional initial hidden state of shape [batch_size, hidden_size]
+    /// Accepts an optional initial hidden state `h`. When `None`, the hidden
+    /// state is zero-initialised to shape `[batch_size, hidden_size]`.
     ///
-    /// # Returns
-    /// Output tensor of shape [batch_size, sequence_length, output_size]
+    /// Returns a tensor of shape `[batch_size, sequence_length, output_size]`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use burn::backend::NdArray;
+    /// # use burn::nn::Initializer;
+    /// # use burn::tensor::Tensor;
+    /// # use burn_gru_time_series_forecasting::gru_model::CustomGruRnnConfig;
+    /// # let device = Default::default();
+    /// # let model = CustomGruRnnConfig::new(4, 16, 4, true, false, 0.0,
+    /// #     Initializer::XavierNormal { gain: 1.0 }).init::<NdArray>(&device);
+    /// let x: Tensor<NdArray, 3> = Tensor::zeros([2, 10, 4], &device);
+    /// let out = model.forward(x, None); // [2, 10, 4]
+    /// ```
     pub fn forward(
         &self,
         x: Tensor<B, 3, Float>,
         h: Option<Tensor<B, 2, Float>>,
     ) -> Tensor<B, 3, Float> {
         let batch_size = x.dims()[0];
-        let _seq_len = x.dims()[1];
 
-        // Initialize hidden state if not provided
         let h = h.unwrap_or_else(|| {
             Tensor::zeros(Shape::new([batch_size, self.gru.d_hidden]), &x.device())
         });
 
-        // Step 1: GRU layer - processes sequence
-        let gru_out = self.gru.forward(x, Some(h)); // [batch_size, seq_len, hidden_size]
-
-        // Step 2: Apply dropout for regularization
+        let gru_out = self.gru.forward(x, Some(h));
         let gru_out = self.dropout.forward(gru_out);
-
-        // Step 3: Reshape for linear layer
-        // [batch_size, seq_len, hidden_size] -> [batch_size * seq_len, hidden_size]
-        // let hidden_size = gru_out.dims()[2];
-        //--let gru_out_flat = gru_out.reshape([batch_size * seq_len, hidden_size]);
-
-        // Step 4: Apply output projection layer (REQUIRED)
-        let gru_out = self.output_projection.forward(gru_out); // [batch_size, seq_len, output_size]
-
-        // Step 5: Apply activation function
+        let gru_out = self.output_projection.forward(gru_out);
         self.activation.forward(gru_out)
     }
 
-    /// Forward pass that returns only the last time step output
-    /// Useful for sequence-to-one tasks (e.g., sequence classification)
+    /// Runs the sequence through the model and returns only the last time-step output.
     ///
-    /// # Arguments
-    /// * `x` - Input tensor of shape [batch_size, sequence_length, input_size]
-    /// * `h` - Optional initial hidden state of shape [batch_size, hidden_size]
+    /// Useful for sequence-to-one tasks such as next-step forecasting. Accepts
+    /// an optional initial hidden state; `None` zero-initialises it.
     ///
-    /// # Returns
-    /// Output tensor of shape [batch_size, output_size]
+    /// Returns a tensor of shape `[batch_size, output_size]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sequence-length dimension of `x` is zero.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use burn::backend::NdArray;
+    /// # use burn::nn::Initializer;
+    /// # use burn::tensor::Tensor;
+    /// # use burn_gru_time_series_forecasting::gru_model::CustomGruRnnConfig;
+    /// # let device = Default::default();
+    /// # let model = CustomGruRnnConfig::new(4, 16, 4, true, false, 0.0,
+    /// #     Initializer::XavierNormal { gain: 1.0 }).init::<NdArray>(&device);
+    /// let x: Tensor<NdArray, 3> = Tensor::zeros([2, 10, 4], &device);
+    /// let pred = model.forward_last(x, None); // [2, 4]
+    /// ```
     pub fn forward_last(
         &self,
         x: Tensor<B, 3, Float>,
         h: Option<Tensor<B, 2, Float>>,
     ) -> Tensor<B, 2, Float> {
-        let output = self.forward(x, h); // [batch_size, seq_len, output_size]
+        let output = self.forward(x, h);
         let batch_size = output.dims()[0];
         let seq_len = output.dims()[1];
         let output_size = output.dims()[2];
 
-        // Extract last time step: select [:, -1, :]
-        // Use reshape instead of squeeze to ensure consistent 2D output
-        // even when batch_size == 1
         output
             .slice([0..batch_size, (seq_len - 1)..seq_len, 0..output_size])
             .reshape([batch_size, output_size])
     }
 }
 
-// --- Multi-Layer Stacked GRU Model (RECOMMENDED for deeper models)
-/// A multi-layer stacked GRU model with output projection
+/// Two-layer stacked GRU model with per-layer dropout and a linear output projection.
+///
+/// Each GRU layer feeds into the next, allowing the model to learn hierarchical
+/// temporal representations. Suitable for sequence-to-sequence or sequence-to-one
+/// regression tasks.
+///
+/// # Examples
+///
+/// ```no_run
+/// use burn::backend::NdArray;
+/// use burn::nn::Initializer;
+/// use burn_gru_time_series_forecasting::gru_model::{StackedGruRnn, StackedGruRnnConfig};
+///
+/// let device = Default::default();
+/// let model: StackedGruRnn<NdArray> = StackedGruRnnConfig::new(
+///     4, 16, 4, true, 0.1, Initializer::XavierNormal { gain: 1.0 },
+/// )
+/// .init(&device);
+/// ```
 #[derive(Module, Debug)]
 pub struct StackedGruRnn<B: Backend> {
-    /// First GRU layer
+    /// First GRU layer; consumes raw input features.
     gru_layer1: Gru<B>,
-    /// Dropout after first layer
+    /// Dropout applied after the first GRU layer.
     dropout1: Dropout,
-    /// Second GRU layer
+    /// Second GRU layer; consumes the first layer's hidden states.
     gru_layer2: Gru<B>,
-    /// Dropout after second layer
+    /// Dropout applied after the second GRU layer.
     dropout2: Dropout,
-    /// Output projection layer
+    /// Projects hidden states from `hidden_size` to `output_size`.
     output_projection: Linear<B>,
 }
 
-/// Configuration for stacked GRU model
+/// Configuration for [`StackedGruRnn`].
 #[derive(Config, Debug)]
 pub struct StackedGruRnnConfig {
+    /// Number of input features per time step.
     input_size: usize,
+    /// Dimensionality of each GRU layer's hidden state.
     hidden_size: usize,
+    /// Number of output features per time step.
     output_size: usize,
+    /// Whether to include bias terms in the GRU gates.
     bias: bool,
+    /// Dropout probability applied after each GRU layer; `0.0` disables dropout.
     dropout: f64,
+    /// Weight initializer for both GRU layers and the linear projection.
     initializer: Initializer,
 }
 
 impl StackedGruRnnConfig {
+    /// Initialises a [`StackedGruRnn`] model from this configuration.
     pub fn init<B: Backend>(&self, device: &B::Device) -> StackedGruRnn<B> {
-        // For simplicity, implementing 2-layer version
-        // In production, you'd use a Vec<Gru<B>> for arbitrary num_layers
         StackedGruRnn {
             gru_layer1: GruConfig::new(self.input_size, self.hidden_size, self.bias)
                 .with_initializer(self.initializer.clone())
@@ -176,11 +252,28 @@ impl StackedGruRnnConfig {
 }
 
 impl<B: Backend> StackedGruRnn<B> {
+    /// Runs a full sequence through both GRU layers and returns all time-step outputs.
+    ///
+    /// Hidden states for each layer are zero-initialised at the start of every call.
+    ///
+    /// Returns a tensor of shape `[batch_size, sequence_length, output_size]`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use burn::backend::NdArray;
+    /// # use burn::nn::Initializer;
+    /// # use burn::tensor::Tensor;
+    /// # use burn_gru_time_series_forecasting::gru_model::StackedGruRnnConfig;
+    /// # let device = Default::default();
+    /// # let model = StackedGruRnnConfig::new(4, 16, 4, true, 0.0,
+    /// #     Initializer::XavierNormal { gain: 1.0 }).init::<NdArray>(&device);
+    /// let x: Tensor<NdArray, 3> = Tensor::zeros([2, 10, 4], &device);
+    /// let out = model.forward(x); // [2, 10, 4]
+    /// ```
     pub fn forward(&self, x: Tensor<B, 3, Float>) -> Tensor<B, 3, Float> {
         let batch_size = x.dims()[0];
-        let _seq_len = x.dims()[1];
 
-        // Layer 1
         let h1 = Tensor::zeros(
             Shape::new([batch_size, self.gru_layer1.d_hidden]),
             &x.device(),
@@ -188,7 +281,6 @@ impl<B: Backend> StackedGruRnn<B> {
         let x = self.gru_layer1.forward(x, Some(h1));
         let x = self.dropout1.forward(x);
 
-        // Layer 2
         let h2 = Tensor::zeros(
             Shape::new([batch_size, self.gru_layer2.d_hidden]),
             &x.device(),
@@ -196,28 +288,39 @@ impl<B: Backend> StackedGruRnn<B> {
         let x = self.gru_layer2.forward(x, Some(h2));
         let x = self.dropout2.forward(x);
 
-        // Output projection
         self.output_projection.forward(x)
     }
 
-    /// Forward pass that returns only the last time step output
-    /// Useful for sequence-to-one tasks (e.g., sequence classification)
+    /// Runs the sequence through both GRU layers and returns only the last time-step output.
     ///
-    /// # Arguments
-    /// * `x` - Input tensor of shape [batch_size, sequence_length, input_size]
-    /// * `h` - Optional initial hidden state of shape [batch_size, hidden_size]
+    /// Useful for sequence-to-one tasks such as next-step forecasting. Hidden states
+    /// are zero-initialised at the start of every call.
     ///
-    /// # Returns
-    /// Output tensor of shape [batch_size, output_size]
+    /// Returns a tensor of shape `[batch_size, output_size]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sequence-length dimension of `x` is zero.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use burn::backend::NdArray;
+    /// # use burn::nn::Initializer;
+    /// # use burn::tensor::Tensor;
+    /// # use burn_gru_time_series_forecasting::gru_model::StackedGruRnnConfig;
+    /// # let device = Default::default();
+    /// # let model = StackedGruRnnConfig::new(4, 16, 4, true, 0.0,
+    /// #     Initializer::XavierNormal { gain: 1.0 }).init::<NdArray>(&device);
+    /// let x: Tensor<NdArray, 3> = Tensor::zeros([2, 10, 4], &device);
+    /// let pred = model.forward_last(x); // [2, 4]
+    /// ```
     pub fn forward_last(&self, x: Tensor<B, 3, Float>) -> Tensor<B, 2, Float> {
-        let output = self.forward(x); // [batch_size, seq_len, output_size]
+        let output = self.forward(x);
         let batch_size = output.dims()[0];
         let seq_len = output.dims()[1];
         let output_size = output.dims()[2];
 
-        // Extract last time step: select [:, -1, :]
-        // Use reshape instead of squeeze to ensure consistent 2D output
-        // even when batch_size == 1
         output
             .slice([0..batch_size, (seq_len - 1)..seq_len, 0..output_size])
             .reshape([batch_size, output_size])

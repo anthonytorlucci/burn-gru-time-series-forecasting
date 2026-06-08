@@ -1,30 +1,59 @@
-// Recurrent Neural Networks (RNNs) are designed to process sequential data, where the order of information is crucial. Unlike traditional neural networks that treat data points as independent, RNNs use an internal memory or "hidden state" to consider the context of past inputs when processing new ones.
-//
-// Preparing data for an RNN
-//
-// To train an RNN, sequential data must be preprocessed into a numerical format with a specific three-dimensional structure.
-//
-// Scale numerical features to a uniform range (e.g., between 0 and 1) to help the model converge faster during training. For example, a z-score normalization (centering data around 0 with a standard deviation of 1) is a common method.
-//
-// Transform the numerical data into sequences using a "sliding window" or "look-back" approach. For a time series, this involves creating pairs of input sequences and target outputs. For example, to predict the next value in a series, you could use the last 10 steps as input.
-//
-// The data must be reshaped into a three-dimensional tensor with the following structure: (number of samples, sequence length, number of features).
-// * Number of samples: The total number of sequences in your dataset.
-// * Sequence length: The number of time steps in each sequence.
-// * Number of features: The number of variables at each time step.
+//! Dataset and batching utilities for stock time-series forecasting with a GRU model.
+//!
+//! This module provides the data pipeline that sits between raw CSV files and the
+//! Burn training loop. It contains three public types:
+//!
+//! - [`StockTimeSeriesItem`] — a single row deserialised from the CSV file.
+//! - [`WindowedStockTimeSeriesDataset`] — a [`burn::data::dataset::Dataset`] that
+//!   applies a sliding-window over the raw rows and exposes each window as a
+//!   [`StockTimeSeriesItemSample`].
+//! - [`StockTimeSeriesBatcher`] — a [`burn::data::dataloader::batcher::Batcher`] that
+//!   collates a `Vec<StockTimeSeriesItemSample>` into a pair of rank-3 input tensor
+//!   `[batch, seq, features]` and rank-2 target tensor `[batch, targets]`.
+//!
+//! # When to use this module
+//!
+//! Use [`WindowedStockTimeSeriesDataset`] when you need a train / test / validation
+//! split of a CSV that contains the columns `Date`, `Open`, `High`, `Low`, `Close`,
+//! `Volume`, and `Name`. Pair it with [`StockTimeSeriesBatcher`] to feed a Burn
+//! [`DataLoader`](burn::data::dataloader::DataLoader).
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::path::PathBuf;
+//! use burn_gru_time_series_forecasting::time_series_dataset::{
+//!     StockTimeSeriesBatcher, WindowedStockTimeSeriesDataset,
+//! };
+//!
+//! let path = PathBuf::from("data/all_stocks_5yr.csv");
+//! let sequence_length = 30;
+//! let split_sizes = (0.7, 0.15, 0.15);
+//!
+//! let train = WindowedStockTimeSeriesDataset::new(
+//!     &path,
+//!     "train",
+//!     split_sizes,
+//!     sequence_length,
+//! )
+//! .expect("failed to build training dataset");
+//!
+//! println!("training windows: {}", burn::data::dataset::Dataset::len(&train));
+//! ```
 
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::Dataset;
 use burn::prelude::Backend;
 use burn::tensor::{Float, Shape, Tensor, TensorData};
-use log;
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+/// Opaque error type returned by dataset construction and CSV parsing operations.
 #[derive(Debug)]
 pub struct DatasetError {
+    /// Human-readable description of the error.
     details: String,
 }
 
@@ -42,11 +71,7 @@ impl fmt::Display for DatasetError {
     }
 }
 
-impl Error for DatasetError {
-    fn description(&self) -> &str {
-        &self.details
-    }
-}
+impl Error for DatasetError {}
 
 impl From<io::Error> for DatasetError {
     fn from(error: io::Error) -> Self {
@@ -64,52 +89,106 @@ impl From<csv::Error> for DatasetError {
     }
 }
 
+/// Represents one CSV row of daily stock OHLCV data.
+///
+/// Field names match the CSV column headers through `serde` rename attributes.
+/// `volume` and `name` are kept as `String` because the source data may contain
+/// non-numeric or ticker-symbol values.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StockTimeSeriesItem {
+    /// Trading date, e.g. `"2013-02-08"`.
     #[serde(rename = "Date")]
     pub date: String,
+    /// Opening price for the trading day.
     #[serde(rename = "Open")]
     pub open: f32,
+    /// Highest price reached during the trading day.
     #[serde(rename = "High")]
     pub high: f32,
+    /// Lowest price reached during the trading day.
     #[serde(rename = "Low")]
     pub low: f32,
+    /// Closing price for the trading day.
     #[serde(rename = "Close")]
     pub close: f32,
+    /// Trading volume as a raw string from the CSV source.
     #[serde(rename = "Volume")]
     pub volume: String,
+    /// Ticker symbol identifying the stock, e.g. `"AAPL"`.
     #[serde(rename = "Name")]
     pub name: String,
 }
 
-// --- Define Input/Target sizes and the Sample Struct ---
-// Let's use 'Open', 'High', 'Low', and 'Close' as our features.
+/// Number of input features extracted from each [`StockTimeSeriesItem`]:
+/// `Open`, `High`, `Low`, `Close`.
 const INPUT_SIZE: usize = 4;
-// We'll predict the 'Open', 'High', 'Low', and 'Close' of the next day.
+
+/// Number of target values predicted for the next day:
+/// `Open`, `High`, `Low`, `Close`.
 const TARGET_SIZE: usize = 4;
 
-/// Represents one complete training sample: a sequence of inputs and a target.
+/// One training sample consisting of an input sequence and a single-step target.
+///
+/// `inputs` holds `sequence_length` feature arrays, each of length `INPUT_SIZE`.
+/// `target` holds the `TARGET_SIZE` values for the day immediately following the
+/// input sequence.
 #[derive(Clone, Debug)]
 pub struct StockTimeSeriesItemSample {
+    /// Ordered sequence of per-day feature arrays used as the model input.
     pub inputs: Vec<[f32; INPUT_SIZE]>,
+    /// Feature array for the day immediately following the input sequence.
     pub target: [f32; TARGET_SIZE],
 }
 
-/// This dataset wraps the raw data and provides sliding windows as samples.
+/// A sliding-window [`Dataset`] over daily stock price data loaded from a CSV file.
+///
+/// Reads the CSV once at construction time, selects the requested split, and then
+/// exposes every valid window of length `sequence_length` as a
+/// [`StockTimeSeriesItemSample`]. The number of available samples is
+/// `split_item_count - sequence_length`.
 pub struct WindowedStockTimeSeriesDataset {
+    /// Raw rows belonging to the selected split.
     items: Vec<StockTimeSeriesItem>,
+    /// Number of consecutive rows that form one input sequence.
     sequence_length: usize,
 }
 
 impl WindowedStockTimeSeriesDataset {
-    /// Creates a new windowed dataset.
+    /// Reads a CSV file and constructs the dataset for a single named split.
     ///
-    /// # Arguments
+    /// `file_path` must point to an existing CSV whose headers include `Date`,
+    /// `Open`, `High`, `Low`, `Close`, `Volume`, and `Name`.
     ///
-    /// * `file_path`: Path to the CSV file.
-    /// * `split`: "train", "test", or "valid".
-    /// * `split_size`: Tuple of (train, test, valid) proportions.
-    /// * `sequence_length`: The hyperparameter for your input sequence length.
+    /// `split` selects which portion of the data to use. Accepted values are
+    /// `"train"`, `"test"`, `"valid"`, and `"validation"`.
+    ///
+    /// `split_size` is a tuple `(train, test, valid)` of proportions. The values
+    /// need not sum to exactly 1.0; if they do not, each proportion is normalised
+    /// by their sum before slicing.
+    ///
+    /// `sequence_length` controls how many consecutive rows form a single input
+    /// window. The split must contain strictly more rows than `sequence_length`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `file_path` does not exist, the CSV cannot be parsed,
+    /// all proportions sum to zero, `split` is not a recognised name, or the
+    /// chosen split contains no more rows than `sequence_length`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::PathBuf;
+    /// use burn_gru_time_series_forecasting::time_series_dataset::WindowedStockTimeSeriesDataset;
+    ///
+    /// let dataset = WindowedStockTimeSeriesDataset::new(
+    ///     &PathBuf::from("data/all_stocks_5yr.csv"),
+    ///     "train",
+    ///     (0.7, 0.15, 0.15),
+    ///     30,
+    /// )
+    /// .unwrap();
+    /// ```
     pub fn new(
         file_path: &PathBuf,
         split: &str,
@@ -142,16 +221,14 @@ impl WindowedStockTimeSeriesDataset {
         if (sum - 1.0).abs() > f32::EPSILON {
             train_prop /= sum;
             test_prop /= sum;
-            //valid_prop /= sum;
         }
 
         let train_count = (total_items as f32 * train_prop).floor() as usize;
         let test_count = (total_items as f32 * test_prop).floor() as usize;
-        //let valid_count = total_items.saturating_sub(train_count + test_count); // Use remainder for validation
 
         let train_end = train_count.min(total_items);
         let test_end = (train_end + test_count).min(total_items);
-        let valid_end = total_items; // Use all remaining data
+        let valid_end = total_items;
 
         log::info!(
             "Dataset split ({}): Train [0..{}], Test [{}..{}], Valid [{}..{}]",
@@ -194,46 +271,48 @@ impl WindowedStockTimeSeriesDataset {
         })
     }
 
-    /// Helper to extract features from a raw data item.
+    /// Extracts the four OHLC features from a raw data item.
     fn item_to_features(item: &StockTimeSeriesItem) -> [f32; INPUT_SIZE] {
         [item.open, item.high, item.low, item.close]
     }
 
-    /// Helper to extract target features from a raw data item.
+    /// Extracts the four OHLC target values from a raw data item.
     fn item_to_target(item: &StockTimeSeriesItem) -> [f32; TARGET_SIZE] {
         [item.open, item.high, item.low, item.close]
     }
 }
 
-/// Implement `Dataset` for our new `WindowedStockDataset`.
-/// The item type `I` is now `StockTimeSeriesItemSample`.
 impl Dataset<StockTimeSeriesItemSample> for WindowedStockTimeSeriesDataset {
+    /// Returns the sample whose input window starts at `index`, or `None` if
+    /// `index` is out of range.
     fn get(&self, index: usize) -> Option<StockTimeSeriesItemSample> {
-        // Check if we have enough items for a full sequence *plus* one target item
         if index + self.sequence_length >= self.items.len() {
             return None;
         }
 
-        // Extract the input sequence
         let inputs: Vec<[f32; INPUT_SIZE]> = (index..index + self.sequence_length)
             .map(|i| Self::item_to_features(&self.items[i]))
             .collect();
 
-        // Extract the target (the item immediately after the sequence)
         let target = Self::item_to_target(&self.items[index + self.sequence_length]);
 
         Some(StockTimeSeriesItemSample { inputs, target })
     }
 
-    /// The number of *possible sequences* we can create.
+    /// Returns the number of complete windows available in this split.
+    ///
+    /// Equal to `split_item_count - sequence_length`. The last `sequence_length`
+    /// rows cannot serve as sequence starts because they have no subsequent target.
     fn len(&self) -> usize {
-        // We can't create a sequence from the last `sequence_length` items
-        // because they don't have a subsequent target.
         self.items.len().saturating_sub(self.sequence_length)
     }
 }
 
-/// This Batcher knows how to handle `StockTimeSeriesItemSample`.
+/// Collates [`StockTimeSeriesItemSample`] values into batched tensors for training.
+///
+/// Produces an input tensor of shape `[batch_size, sequence_length, INPUT_SIZE]`
+/// and a target tensor of shape `[batch_size, TARGET_SIZE]`. Both tensors use
+/// `f32` element type.
 pub struct StockTimeSeriesBatcher<B: Backend> {
     _backend: std::marker::PhantomData<B>,
 }
@@ -245,6 +324,7 @@ impl<B: Backend> Default for StockTimeSeriesBatcher<B> {
 }
 
 impl<B: Backend> StockTimeSeriesBatcher<B> {
+    /// Creates a new batcher for the given backend type.
     pub fn new() -> Self {
         Self {
             _backend: std::marker::PhantomData,
@@ -252,24 +332,24 @@ impl<B: Backend> StockTimeSeriesBatcher<B> {
     }
 }
 
-// Returns source and target tensors with shapes:
-// [batch_size, sequence_length, input_size]
-// [batch_size, output_size]
 impl<B: Backend> Batcher<B, StockTimeSeriesItemSample, (Tensor<B, 3, Float>, Tensor<B, 2, Float>)>
     for StockTimeSeriesBatcher<B>
 {
-    /// The `batch` method now receives a `Vec` of our `StockTimeSeriesItemSample`s.
+    /// Collates a vector of samples into an `(inputs, targets)` tensor pair.
+    ///
+    /// The returned input tensor has shape `[batch_size, sequence_length, INPUT_SIZE]`
+    /// and the returned target tensor has shape `[batch_size, TARGET_SIZE]`.
+    /// Both are placed on `device`. If `items` is empty the tensors have a
+    /// zero sequence-length dimension and contain no data.
     fn batch(
         &self,
         items: Vec<StockTimeSeriesItemSample>,
         device: &B::Device,
     ) -> (Tensor<B, 3, Float>, Tensor<B, 2, Float>) {
         let batch_size: usize = items.len();
-        // Get sequence length from the first item. Assumes all items are the same length.
         let sequence_length: usize = items.first().map_or(0, |item| item.inputs.len());
 
         if sequence_length == 0 {
-            // Handle empty batch
             let inputs_shape: Shape = Shape::new([batch_size, 0, INPUT_SIZE]);
             let targets_shape: Shape = Shape::new([batch_size, TARGET_SIZE]);
             return (
@@ -289,28 +369,23 @@ impl<B: Backend> Batcher<B, StockTimeSeriesItemSample, (Tensor<B, 3, Float>, Ten
         let mut targets_data: Vec<f32> = Vec::with_capacity(batch_size * TARGET_SIZE);
 
         for item in items {
-            // Flatten the sequence of inputs
-            // item.inputs is Vec<[f32; INPUT_SIZE]> of length `sequence_length`
             for input_features in item.inputs {
                 inputs_data.extend_from_slice(&input_features);
             }
-            // Add the target features
             targets_data.extend_from_slice(&item.target);
         }
 
-        // Create input tensor: [batch_size, sequence_length, input_size]
         let inputs_shape: Shape = Shape::new([batch_size, sequence_length, INPUT_SIZE]);
-        let inputs_tensor_data: TensorData = TensorData::new(inputs_data, inputs_shape.clone());
-        // Specify <B, 3, Float> to match the tensor dimensions and type
-        let inputs_tensor: Tensor<B, 3, Float> =
-            Tensor::<B, 3, Float>::from_data(inputs_tensor_data.convert::<f32>(), device);
+        let inputs_tensor: Tensor<B, 3, Float> = Tensor::<B, 3, Float>::from_data(
+            TensorData::new(inputs_data, inputs_shape).convert::<f32>(),
+            device,
+        );
 
-        // Create target tensor: [batch_size, target_size]
         let targets_shape: Shape = Shape::new([batch_size, TARGET_SIZE]);
-        let targets_tensor_data: TensorData = TensorData::new(targets_data, targets_shape.clone());
-        // Specify <B, 2, Float>
-        let targets_tensor: Tensor<B, 2, Float> =
-            Tensor::<B, 2, Float>::from_data(targets_tensor_data.convert::<f32>(), device);
+        let targets_tensor: Tensor<B, 2, Float> = Tensor::<B, 2, Float>::from_data(
+            TensorData::new(targets_data, targets_shape).convert::<f32>(),
+            device,
+        );
 
         (inputs_tensor, targets_tensor)
     }
