@@ -25,5 +25,9 @@ target
 
 /target
 
+# OS
+.DS_Store
+
 # Project specific
 models/
+CLAUDE.md
