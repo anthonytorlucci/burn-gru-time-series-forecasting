@@ -68,7 +68,7 @@ pub struct CustomGruRnn<B: Backend> {
     activation: Tanh,
 }
 
-/// Configuration for [`CustomGruRnn`].
+/// Configuration for [`CustomGruRnn`]
 #[derive(Config, Debug)]
 pub struct CustomGruRnnConfig {
     /// Number of input features per time step.
@@ -88,7 +88,25 @@ pub struct CustomGruRnnConfig {
 }
 
 impl CustomGruRnnConfig {
-    /// Initialises a [`CustomGruRnn`] model from this configuration.
+    /// Initialise a [`CustomGruRnn`] model from this configuration
+    ///
+    /// Both the GRU layer and the output projection are initialised on `device`
+    /// using the `initializer` specified in the configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use burn::backend::NdArray;
+    /// use burn::nn::Initializer;
+    /// use burn_gru_time_series_forecasting::gru_model::{CustomGruRnn, CustomGruRnnConfig};
+    ///
+    /// let device = Default::default();
+    /// let model: CustomGruRnn<NdArray> = CustomGruRnnConfig::new(
+    ///     4, 16, 4, true, false, 0.1,
+    ///     Initializer::XavierNormal { gain: 1.0 },
+    /// )
+    /// .init(&device);
+    /// ```
     pub fn init<B: Backend>(&self, device: &B::Device) -> CustomGruRnn<B> {
         CustomGruRnn {
             gru: GruConfig::new(self.input_size, self.hidden_size, self.bias)
@@ -215,7 +233,7 @@ pub struct StackedGruRnn<B: Backend> {
     output_projection: Linear<B>,
 }
 
-/// Configuration for [`StackedGruRnn`].
+/// Configuration for [`StackedGruRnn`]
 #[derive(Config, Debug)]
 pub struct StackedGruRnnConfig {
     /// Number of input features per time step.
@@ -233,7 +251,25 @@ pub struct StackedGruRnnConfig {
 }
 
 impl StackedGruRnnConfig {
-    /// Initialises a [`StackedGruRnn`] model from this configuration.
+    /// Initialise a [`StackedGruRnn`] model from this configuration
+    ///
+    /// Both GRU layers and the output projection are initialised on `device` using
+    /// the same `initializer`. The second GRU layer receives `hidden_size` as its
+    /// input size because it consumes the output of the first layer.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use burn::backend::NdArray;
+    /// use burn::nn::Initializer;
+    /// use burn_gru_time_series_forecasting::gru_model::{StackedGruRnn, StackedGruRnnConfig};
+    ///
+    /// let device = Default::default();
+    /// let model: StackedGruRnn<NdArray> = StackedGruRnnConfig::new(
+    ///     4, 16, 4, true, 0.1, Initializer::XavierNormal { gain: 1.0 },
+    /// )
+    /// .init(&device);
+    /// ```
     pub fn init<B: Backend>(&self, device: &B::Device) -> StackedGruRnn<B> {
         StackedGruRnn {
             gru_layer1: GruConfig::new(self.input_size, self.hidden_size, self.bias)

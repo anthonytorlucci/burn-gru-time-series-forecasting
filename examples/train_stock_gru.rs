@@ -1,16 +1,16 @@
-//! Training binary for GRU-based stock price forecasting.
+//! Train a stacked GRU model on historical GOOGL stock-price data.
 //!
 //! Reads OHLC (open, high, low, close) price data from a CSV file, trains a
 //! two-layer stacked GRU model using the Burn framework on the WGPU backend,
 //! and saves the trained model artefacts to disk.
 //!
-//! # Usage
+//! # Running
 //!
 //! ```text
-//! cargo run --release
+//! cargo run --example train_stock_gru --release
 //! ```
 //!
-//! The binary expects the following paths relative to the working directory:
+//! The example expects the following paths relative to the working directory:
 //!
 //! - `data/GOOGL-stock-time-series/GOOGL_2006-01-01_to_2018-01-01.csv` — input CSV
 //! - `models/stock-time-series-gru/` — output directory for the saved model and config
@@ -21,7 +21,7 @@
 //!
 //! - `config.json` — serialised [`StackedGruRnnTrainingConfig`]
 //! - `StockTimeSeries.mpk.gz` — trained model weights in compact record format
-//! - Burn training metrics and checkpoints written by the [`SupervisedTraining`] runner
+//! - Burn training metrics and checkpoints written by the `SupervisedTraining` runner
 
 use burn::backend::Autodiff;
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
@@ -31,7 +31,6 @@ use burn_gru_time_series_forecasting::gru_model::StackedGruRnnConfig;
 use burn_gru_time_series_forecasting::time_series_training::StackedGruRnnTrainingConfig;
 use std::path::Path;
 
-/// Configures and launches model training on the default WGPU device.
 fn main() {
     type MyBackend = Wgpu<f32, i32>;
     let device = WgpuDevice::default();

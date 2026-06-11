@@ -50,10 +50,15 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-/// Opaque error type returned by dataset construction and CSV parsing operations.
+/// Error type returned by dataset construction and CSV parsing operations.
+///
+/// Wraps the underlying cause as a human-readable string so callers do not need
+/// to depend on `csv` or `std::io` error types directly. Implements
+/// [`std::error::Error`] and converts from [`io::Error`] and [`csv::Error`]
+/// via [`From`].
 #[derive(Debug)]
 pub struct DatasetError {
-    /// Human-readable description of the error.
+    // Private: callers observe this value through the `Display` impl.
     details: String,
 }
 
@@ -73,6 +78,10 @@ impl fmt::Display for DatasetError {
 
 impl Error for DatasetError {}
 
+/// Converts an [`io::Error`] into a [`DatasetError`] by capturing its message.
+///
+/// Allows `?` to be used on file-open operations inside dataset constructors
+/// that return `Result<_, DatasetError>`.
 impl From<io::Error> for DatasetError {
     fn from(error: io::Error) -> Self {
         DatasetError {
@@ -81,6 +90,10 @@ impl From<io::Error> for DatasetError {
     }
 }
 
+/// Converts a [`csv::Error`] into a [`DatasetError`] by capturing its message.
+///
+/// Allows `?` to be used on CSV deserialization calls inside dataset constructors
+/// that return `Result<_, DatasetError>`.
 impl From<csv::Error> for DatasetError {
     fn from(error: csv::Error) -> Self {
         DatasetError {
@@ -112,6 +125,9 @@ pub struct StockTimeSeriesItem {
     #[serde(rename = "Close")]
     pub close: f32,
     /// Trading volume as a raw string from the CSV source.
+    ///
+    /// Kept as `String` because some data providers include formatting characters
+    /// (commas, suffixes) that prevent direct `f32` parsing.
     #[serde(rename = "Volume")]
     pub volume: String,
     /// Ticker symbol identifying the stock, e.g. `"AAPL"`.
@@ -134,9 +150,16 @@ const TARGET_SIZE: usize = 4;
 /// input sequence.
 #[derive(Clone, Debug)]
 pub struct StockTimeSeriesItemSample {
-    /// Ordered sequence of per-day feature arrays used as the model input.
+    /// Ordered sequence of per-day OHLC feature arrays used as the model input.
+    ///
+    /// Length equals the `sequence_length` passed to
+    /// [`WindowedStockTimeSeriesDataset::new`]. Each element is
+    /// `[open, high, low, close]` for one calendar day.
     pub inputs: Vec<[f32; INPUT_SIZE]>,
-    /// Feature array for the day immediately following the input sequence.
+    /// OHLC values for the day immediately following the input sequence.
+    ///
+    /// Serves as the supervised label: `[open, high, low, close]` of the day
+    /// the model is asked to forecast.
     pub target: [f32; TARGET_SIZE],
 }
 
@@ -271,12 +294,15 @@ impl WindowedStockTimeSeriesDataset {
         })
     }
 
-    /// Extracts the four OHLC features from a raw data item.
+    // Selects only the four OHLC price fields the model consumes as inputs,
+    // discarding date, volume, and ticker columns.
     fn item_to_features(item: &StockTimeSeriesItem) -> [f32; INPUT_SIZE] {
         [item.open, item.high, item.low, item.close]
     }
 
-    /// Extracts the four OHLC target values from a raw data item.
+    // Selects the four OHLC price fields used as the supervised target.
+    // Kept as a separate function from `item_to_features` so the input and
+    // target feature sets can diverge independently in the future.
     fn item_to_target(item: &StockTimeSeriesItem) -> [f32; TARGET_SIZE] {
         [item.open, item.high, item.low, item.close]
     }
@@ -285,6 +311,11 @@ impl WindowedStockTimeSeriesDataset {
 impl Dataset<StockTimeSeriesItemSample> for WindowedStockTimeSeriesDataset {
     /// Returns the sample whose input window starts at `index`, or `None` if
     /// `index` is out of range.
+    ///
+    /// The window spans rows `index..index + sequence_length` as inputs and
+    /// row `index + sequence_length` as the target. Returns `None` when the
+    /// window would extend past the end of the split, consistent with the count
+    /// returned by [`Self::len`].
     fn get(&self, index: usize) -> Option<StockTimeSeriesItemSample> {
         if index + self.sequence_length >= self.items.len() {
             return None;
@@ -312,19 +343,38 @@ impl Dataset<StockTimeSeriesItemSample> for WindowedStockTimeSeriesDataset {
 ///
 /// Produces an input tensor of shape `[batch_size, sequence_length, INPUT_SIZE]`
 /// and a target tensor of shape `[batch_size, TARGET_SIZE]`. Both tensors use
-/// `f32` element type.
+/// `f32` element type and are placed on the device supplied to [`Batcher::batch`].
+///
+/// `B` is the Burn backend (e.g. `Wgpu`, `NdArray`, `Autodiff<Wgpu>`). The struct
+/// holds no runtime state; all backend specialisation is carried through the
+/// `PhantomData` marker.
 pub struct StockTimeSeriesBatcher<B: Backend> {
     _backend: std::marker::PhantomData<B>,
 }
 
 impl<B: Backend> Default for StockTimeSeriesBatcher<B> {
+    /// Creates a [`StockTimeSeriesBatcher`] using default construction.
+    ///
+    /// Delegates to [`StockTimeSeriesBatcher::new`].
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl<B: Backend> StockTimeSeriesBatcher<B> {
-    /// Creates a new batcher for the given backend type.
+    /// Creates a new batcher for backend `B`.
+    ///
+    /// The batcher holds no configuration; all shape information is inferred
+    /// from the samples passed to [`Batcher::batch`] at runtime.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use burn::backend::NdArray;
+    /// use burn_gru_time_series_forecasting::time_series_dataset::StockTimeSeriesBatcher;
+    ///
+    /// let batcher = StockTimeSeriesBatcher::<NdArray>::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             _backend: std::marker::PhantomData,
@@ -340,7 +390,10 @@ impl<B: Backend> Batcher<B, StockTimeSeriesItemSample, (Tensor<B, 3, Float>, Ten
     /// The returned input tensor has shape `[batch_size, sequence_length, INPUT_SIZE]`
     /// and the returned target tensor has shape `[batch_size, TARGET_SIZE]`.
     /// Both are placed on `device`. If `items` is empty the tensors have a
-    /// zero sequence-length dimension and contain no data.
+    /// zero sequence-length dimension and contain no data. `sequence_length` is
+    /// inferred from the first sample; all samples in a batch must share the same
+    /// sequence length, which is guaranteed when they originate from the same
+    /// [`WindowedStockTimeSeriesDataset`].
     fn batch(
         &self,
         items: Vec<StockTimeSeriesItemSample>,

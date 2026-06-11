@@ -23,9 +23,11 @@
 //!
 //! # Quick start
 //!
+//! The example below uses the `NdArray` backend, which has no external dependencies
+//! and works on any platform. Switch to `Wgpu` or `Cuda` for GPU-accelerated training.
+//!
 //! ```no_run
-//! use burn::backend::Autodiff;
-//! use burn::backend::wgpu::{Wgpu, WgpuDevice};
+//! use burn::backend::{Autodiff, NdArray};
 //! use burn::nn::Initializer;
 //! use burn::optim::AdamConfig;
 //! use burn_gru_time_series_forecasting::gru_model::StackedGruRnnConfig;
@@ -34,9 +36,7 @@
 //! };
 //! use std::path::Path;
 //!
-//! type Backend = Wgpu<f32, i32>;
-//!
-//! let device = WgpuDevice::default();
+//! type Backend = Autodiff<NdArray>;
 //!
 //! let model_config = StackedGruRnnConfig::new(
 //!     4,    // input_size
@@ -58,19 +58,31 @@
 //! .with_seed(42)
 //! .with_learning_rate(1e-4);
 //!
-//! train::<Autodiff<Backend>>(
+//! train::<Backend>(
 //!     Path::new("data/GOOGL_2006-01-01_to_2018-01-01.csv"),
 //!     Path::new("models/stock-time-series-gru"),
 //!     training_config,
-//!     &device,
+//!     &Default::default(),
 //! );
 //! ```
 
-/// GRU model definitions and configuration types for time-series forecasting.
+/// GRU model architectures for time-series regression.
+///
+/// Start here when you need a model struct for inference or a custom training loop.
+/// For end-to-end supervised training from a CSV file, see [`time_series_training`].
 pub mod gru_model;
 
-/// Sliding-window dataset, raw item types, and batcher for stock time-series CSV data.
+/// Data pipeline for windowed stock time-series loaded from CSV.
+///
+/// Provides the dataset and batcher types that sit between a raw CSV file and a
+/// Burn dataloader. The expected CSV schema is fixed (`Date`, `Open`, `High`,
+/// `Low`, `Close`, `Volume`, `Name`); extend or replace the types here when
+/// working with a different data source.
 pub mod time_series_dataset;
 
-/// Training loop, `TrainStep`/`InferenceStep` implementations, and training configuration.
+/// End-to-end supervised training loop for [`gru_model::StackedGruRnn`].
+///
+/// Exposes a single [`train`](time_series_training::train) function and the
+/// [`StackedGruRnnTrainingConfig`](time_series_training::StackedGruRnnTrainingConfig)
+/// needed to configure it.
 pub mod time_series_training;

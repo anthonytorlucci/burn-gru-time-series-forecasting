@@ -3,6 +3,13 @@ name = "burn-gru-time-series-forecasting"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "burn_gru_time_series_forecasting"
+path = "src/lib.rs"
+
+[[example]]
+name = "train_stock_gru"
+
 [dependencies]
 burn = { version = "0.21.0", features = ["train", "wgpu", "fusion"] }
 serde = { version = "1.0.228" }
